@@ -48,6 +48,28 @@ fn answers_the_dangling_call(messages: &[CompletionMessage]) -> bool {
     })
 }
 
+/// The message after the assistant that opened [`DANGLING_CALL_ID`] answers
+/// it. A later answer is not enough: a user message between the two is
+/// rejected.
+fn the_next_message_answers_the_dangling_call(messages: &[CompletionMessage]) -> bool {
+    let Some(opened) = messages.iter().position(|message| {
+        message.role == MessageRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.call_id == DANGLING_CALL_ID)
+    }) else {
+        return false;
+    };
+    messages.get(opened + 1).is_some_and(|message| {
+        message.role == MessageRole::Tool
+            && message
+                .tool_results
+                .iter()
+                .any(|result| result.call_id == DANGLING_CALL_ID)
+    })
+}
+
 /// A provider that fails the test if the turn ever calls it — both witnesses
 /// below abort at the top of the step, before any model call.
 fn provider_that_must_not_be_called() -> ScriptedProvider {
@@ -101,7 +123,9 @@ async fn an_over_cap_budget_abort_hands_back_a_well_paired_transcript() {
 #[tokio::test(start_paused = true)]
 async fn a_past_deadline_abort_hands_back_a_well_paired_transcript() {
     // The same witness for the deadline arm, which is checked first and has
-    // its own reason string — and had the same missing repair.
+    // its own reason string — and had the same missing repair. A deadline
+    // already past also makes a notice due on this step, and that notice
+    // waits until the call is answered.
     let provider = provider_that_must_not_be_called();
     let provider_calls = provider.calls.clone();
     let tools = CountingTools {
@@ -131,6 +155,11 @@ async fn a_past_deadline_abort_hands_back_a_well_paired_transcript() {
     assert!(
         answers_the_dangling_call(&messages),
         "a deadline abort must answer the open tool_use it hands back: {messages:?}"
+    );
+    assert!(
+        the_next_message_answers_the_dangling_call(&messages),
+        "the tool result must be the next message after the assistant that opened the call: \
+         {messages:?}"
     );
 }
 

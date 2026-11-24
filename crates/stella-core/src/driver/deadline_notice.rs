@@ -112,13 +112,21 @@ pub(crate) struct DeadlineNotices {
 }
 
 impl DeadlineNotices {
+    /// The turn's whole budget, taken from the first remaining time seen.
+    ///
+    /// A step that cannot send a notice still records this. The ladder is a
+    /// fraction of that budget, and a later reading is only the time left.
+    fn latch_budget(&mut self, remaining_ms: u64) -> u64 {
+        *self.budget_ms.get_or_insert(remaining_ms)
+    }
+
     /// The notice due at `remaining_ms`, or `None` when none is.
     ///
     /// Returns the text for the *tightest* newly-crossed threshold and marks
     /// every threshold at or above it as delivered, so a step that skips past
     /// two of them costs one message rather than two.
     pub(crate) fn due(&mut self, remaining_ms: u64) -> Option<String> {
-        let budget_ms = *self.budget_ms.get_or_insert(remaining_ms);
+        let budget_ms = self.latch_budget(remaining_ms);
         let bands = thresholds_for(budget_ms);
         let crossed = bands
             .iter()
@@ -137,16 +145,52 @@ impl DeadlineNotices {
 /// The whole effect lives here rather than at the call site so `driver.rs`
 /// carries one line: it is a god file closed to growth, and this module is
 /// where the decision belongs anyway.
+///
+/// An unanswered tool call keeps this quiet. The message that answers the
+/// call has to come next, and [`DeadlineNotices::due`] would mark the rung
+/// spent if it ran before that answer existed. The first remaining time is
+/// still recorded, so the same rung is offered once the call is closed.
 pub(crate) fn push_if_due(state: &mut crate::step::TurnState, now: std::time::Instant) {
     let Some(remaining) = state.budget.deadline_remaining(now) else {
         return;
     };
     let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+    if holds_unanswered_tool_call(&state.messages) {
+        state.deadline_notices.latch_budget(remaining_ms);
+        return;
+    }
     if let Some(notice) = state.deadline_notices.due(remaining_ms) {
         state
             .messages
             .push(stella_protocol::CompletionMessage::user(notice));
     }
+}
+
+/// Whether `messages` still holds a tool call nothing has answered.
+///
+/// Same pairing as [`crate::step::close_open_tool_calls`]: a result claims
+/// the latest open call with its id. A user message must not land while one
+/// is open, because the answer has to be the next message.
+fn holds_unanswered_tool_call(messages: &[stella_protocol::CompletionMessage]) -> bool {
+    let mut open = Vec::new();
+    for message in messages {
+        match message.role {
+            stella_protocol::MessageRole::Assistant => {
+                open.extend(message.tool_calls.iter().map(|call| call.call_id.as_str()));
+            }
+            stella_protocol::MessageRole::Tool => {
+                for result in &message.tool_results {
+                    if let Some(position) =
+                        open.iter().rposition(|call_id| *call_id == result.call_id)
+                    {
+                        open.remove(position);
+                    }
+                }
+            }
+            stella_protocol::MessageRole::System | stella_protocol::MessageRole::User => {}
+        }
+    }
+    !open.is_empty()
 }
 
 /// The notice's marker prefix — one entry of
@@ -362,5 +406,99 @@ mod tests {
         notices.due(840_000);
         assert!(notices.due(110_000).is_some());
         assert!(notices.due(580_000).is_none());
+    }
+
+    fn state_with_open_call(
+        now: std::time::Instant,
+        deadline: std::time::Instant,
+    ) -> crate::step::TurnState {
+        let mut budget = crate::BudgetGuard::new(stella_protocol::BudgetMode::Off, None, None);
+        budget.set_task_deadline(Some(deadline));
+        crate::step::TurnState::new(
+            vec![
+                stella_protocol::CompletionMessage::user("the task"),
+                stella_protocol::CompletionMessage {
+                    role: stella_protocol::MessageRole::Assistant,
+                    content: String::new(),
+                    tool_calls: vec![stella_protocol::ToolCall {
+                        call_id: "call-1".into(),
+                        name: "bash".into(),
+                        input: serde_json::json!({}),
+                    }],
+                    tool_results: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            ],
+            budget,
+            &crate::EngineConfig::default(),
+            now,
+        )
+    }
+
+    fn answer_the_open_call(state: &mut crate::step::TurnState) {
+        state.messages.push(stella_protocol::CompletionMessage {
+            role: stella_protocol::MessageRole::Tool,
+            content: String::new(),
+            tool_calls: Vec::new(),
+            tool_results: vec![stella_protocol::ToolResult {
+                call_id: "call-1".into(),
+                output: stella_protocol::ToolOutput::error("closed"),
+            }],
+            attachments: Vec::new(),
+        });
+    }
+
+    /// A notice that is due beside an open tool call waits. The rung is
+    /// still offered once that call is answered.
+    #[test]
+    fn an_open_tool_call_defers_a_due_notice_until_the_call_is_answered() {
+        let now = std::time::Instant::now();
+        let mut state = state_with_open_call(now, now - std::time::Duration::from_secs(1));
+
+        push_if_due(&mut state, now);
+
+        assert_eq!(
+            state.messages.len(),
+            2,
+            "a notice must not sit between the call and its result"
+        );
+
+        answer_the_open_call(&mut state);
+        push_if_due(&mut state, now);
+
+        let notice = state.messages.last().expect("the deferred notice");
+        assert_eq!(notice.role, stella_protocol::MessageRole::User);
+        assert!(
+            notice.content.starts_with(DEADLINE_MARKER_PREFIX),
+            "the rung must still be offered once the call is answered: {}",
+            notice.content
+        );
+        assert_eq!(
+            state.messages[2].role,
+            stella_protocol::MessageRole::Tool,
+            "the result stays the message after the assistant that opened the call"
+        );
+    }
+
+    /// The first remaining time is the whole budget, even on a step that
+    /// sends no notice. The next step then crosses the rung that budget
+    /// implies.
+    #[test]
+    fn a_deferred_notice_keeps_the_budget_from_the_first_reading() {
+        let opened = std::time::Instant::now();
+        let mut state = state_with_open_call(opened, opened + std::time::Duration::from_secs(840));
+
+        push_if_due(&mut state, opened);
+        assert_eq!(state.messages.len(), 2, "the starting line sends nothing");
+
+        answer_the_open_call(&mut state);
+        push_if_due(&mut state, opened + std::time::Duration::from_secs(260));
+
+        let notice = state.messages.last().expect("the first rung");
+        assert!(
+            notice.content.contains("prefer finishing"),
+            "the first rung is measured from the original budget: {}",
+            notice.content
+        );
     }
 }
